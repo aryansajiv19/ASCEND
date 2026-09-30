@@ -1,196 +1,100 @@
 # ASCEND
 
-AI fitness coaching with per-muscle recovery scoring, natural-language workout logging and live challenges.
-
-![Node.js](https://img.shields.io/badge/Node.js-20-339933?logo=node.js&logoColor=white)
-![Express](https://img.shields.io/badge/Express-5-000?logo=express)
-![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)
-![React](https://img.shields.io/badge/React-18-149eca?logo=react&logoColor=white)
-![License: MIT](https://img.shields.io/badge/License-MIT-blue)
+A training app that estimates per-muscle recovery from recent workouts, logs sessions from plain-English descriptions, and provides an AI coach grounded in the user's own training data.
 
 ![ASCEND dashboard with per-muscle recovery scores](./docs/dashboard.png)
 
 ## Overview
 
-ASCEND is a full-stack training application. It estimates how recovered each muscle group is from recent training volume and time elapsed, lets users log sessions in plain English, and provides an AI coach that answers with the user's training history and recovery state as context. Users can also join challenges whose leaderboards update in real time over WebSockets.
+Generic workout apps record what you did but say little about what you should do next. ASCEND scores how recovered each muscle group is, so the next session can target what is ready, and pairs that with a coach that sees the user's actual history rather than giving generic advice.
 
-## Contents
+It also supports live group challenges, with leaderboards that update as participants log workouts.
 
-- [Features](#features)
-- [Architecture](#architecture)
-- [Implementation notes](#implementation-notes)
-- [Getting started](#getting-started)
-- [API reference](#api-reference)
-- [Project structure](#project-structure)
-- [Roadmap](#roadmap)
-- [License](#license)
+## Highlights
 
-## Features
+- **Recovery scoring.** A deterministic 0 to 100 readiness score for seven muscle groups, computed from the past seven days of training volume and elapsed time.
+- **Grounded AI coaching.** Each chat request includes the user's 20 most recent workouts and current recovery scores, and the response streams over Server-Sent Events.
+- **Validated natural-language logging.** Free-text descriptions become structured workout records; model output that does not parse is rejected rather than stored.
+- **Real-time challenges.** Leaderboard updates are pushed over socket.io only to the rooms of challenges the participant has joined.
 
-- **Recovery scoring.** A 0 to 100 readiness score for seven muscle groups, computed from the previous seven days of training.
-- **AI coach.** Streaming chat (Server-Sent Events) backed by Claude Sonnet 4, grounded in the user's recent workouts and current recovery scores.
-- **Natural-language logging.** A free-text description of a session is converted by the model into a structured workout record.
-- **Workout search.** PostgreSQL full-text search ranked with `ts_rank`, with an `ILIKE` fallback for partial matches.
-- **Live challenges.** Challenge rooms with leaderboards pushed to participants through socket.io.
-- **Authentication.** Password hashing with bcrypt and JWT-protected API routes.
-- **Containerised deployment.** Docker images for the API and an nginx-served frontend, orchestrated with docker-compose.
+## How it works
+
+1. A user logs a workout through a form or by describing it, for example "4 sets of 8 bench at 80 kg".
+2. Descriptions are sent to Claude with a strict output specification and converted into exercise, sets, reps, weight and muscle group.
+3. The recovery endpoint recomputes readiness for each muscle group from the last seven days of workouts.
+4. The coach combines recent workouts and recovery into the prompt and streams its answer.
+5. If the user is in any challenges, standings are recalculated and pushed to the relevant rooms.
 
 ## Architecture
 
 ```mermaid
-flowchart TB
-    subgraph Client
-        UI[React 18 + Vite<br/>dashboard, logger, coach, challenges]
-    end
-    subgraph Server["Express 5 + socket.io"]
-        AUTH[/api/auth<br/>bcrypt + JWT/]
-        W[/api/workouts<br/>CRUD, search, voice/]
-        R[/api/recovery/]
-        C[/api/chat<br/>SSE streaming/]
-        CH[/api/challenges<br/>+ leaderboard/]
-        WS[WebSocket rooms]
-    end
-    DB[(PostgreSQL 16<br/>+ pgvector)]
-    LLM[Anthropic Claude Sonnet 4]
-    UI -- HTTP --> AUTH & W & R & C & CH
-    UI <-- WebSocket --> WS
-    AUTH & W & R & CH --> DB
-    C --> DB
-    C --> LLM
-    W -- voice parsing --> LLM
+flowchart LR
+    UI[React client] -- HTTP --> API[Express API]
+    UI <-- WebSocket --> WS[socket.io rooms]
+    API --> DB[(PostgreSQL)]
     WS --> DB
+    API -- coaching, parsing --> LLM[Claude Sonnet 4]
 ```
 
-| Layer | Technology |
-|---|---|
-| Client | React 18, Vite 6, CSS custom properties |
-| Server | Node.js 20, Express 5, socket.io 4 |
-| Database | PostgreSQL 16 with the pgvector extension |
-| AI | Anthropic Claude Sonnet 4 (coaching and structured parsing) |
-| Auth | bcrypt, JSON Web Tokens |
-| Deployment | Docker, docker-compose, nginx |
+A single Express 5 server hosts the REST API and the socket.io server, backed by one PostgreSQL connection pool. The React client is built with Vite and served by nginx in production, which also proxies API and WebSocket traffic to the server. Authentication uses bcrypt password hashes and JWTs checked by middleware on every protected route.
 
-## Implementation notes
+## Engineering decisions
 
-**Recovery model.** Each muscle group starts at 100. For every workout in the last seven days, fatigue equal to `min(sets × reps × weight / 100, 60)` is subtracted and 15 points per elapsed day are restored, with the result clamped to 0 to 100. The model is deliberately simple and deterministic, so its output is explainable and easy to tune.
+**A simple, explainable recovery model.** Each muscle starts at 100. Every workout in the last week subtracts `min(sets × reps × weight / 100, 60)` and 15 points are restored per elapsed day, clamped to 0 to 100. A learned model would need data the app does not yet have; a transparent formula is easy to reason about and tune, at the cost of ignoring individual recovery rates.
 
-**Grounded coaching.** Each chat request loads the user's 20 most recent workouts and computes current recovery before calling the model, so advice reflects actual training rather than generic guidance. Responses stream to the client over SSE.
+**Grounding over prompting.** Rather than asking the model general fitness questions, the server assembles the user's own data into each request. This makes answers specific without fine-tuning, with the trade-off of larger prompts that scale with history, which is why context is capped at 20 workouts.
 
-**Structured parsing with validation.** Natural-language logging instructs the model to return a JSON object with a fixed set of fields and an enumerated muscle group. Output that fails to parse is rejected with HTTP 422 rather than written to the database.
+**Rejecting unparseable model output.** Natural-language logging instructs the model to return a fixed JSON shape with an enumerated muscle group. Output that fails to parse returns HTTP 422 instead of writing a partial record, so malformed responses never corrupt training history.
 
-**Search with graceful degradation.** Ranked full-text search runs first; if it returns nothing or errors, the query falls back to case-insensitive substring matching so users still get results.
+**Search that degrades gracefully.** Workout search runs PostgreSQL full-text search ranked by `ts_rank` first, and falls back to case-insensitive substring matching when full-text returns nothing or errors. Users always get results, even for partial words that stemming misses.
 
-**Real-time leaderboards.** When a participant logs a workout, the server recalculates standings for each challenge the participant has joined and emits `leaderboard_update` to those socket.io rooms only.
+**Scoped real-time updates.** Instead of broadcasting every change, a logged workout triggers recalculation only for the challenges that participant has joined, and emits only to those rooms.
 
-**Idempotent schema bootstrap.** `setup.js` creates tables and constraints with `IF NOT EXISTS` guards and can be re-run safely. A 1,536-dimension `vector` column and an IVFFlat index are provisioned for planned embedding-based search.
+## Tech stack
+
+**Frontend:** React 18, Vite  
+**Backend:** Node.js 20, Express 5, socket.io 4  
+**Database:** PostgreSQL 16 with pgvector  
+**AI:** Anthropic Claude Sonnet 4  
+**Infrastructure:** Docker, docker-compose, nginx
+
+## Testing
+
+There is no automated test suite yet. The recovery model and the output parser are pure functions and are the first candidates for unit tests.
 
 ## Getting started
 
-### Prerequisites
-
-- Node.js 20 or later
-- PostgreSQL 16 or later with the pgvector extension
-- An [Anthropic API key](https://console.anthropic.com/)
-- Docker (optional)
-
-### Configuration
+Requires Node.js 20+, PostgreSQL 16 with pgvector, and an Anthropic API key. Set `DATABASE_URL`, `JWT_SECRET` and `ANTHROPIC_API_KEY` in `.env` (see `.env.example`).
 
 ```bash
-cp .env.example .env
+docker-compose up --build    # database, API on :3000, client on :80
 ```
 
-| Variable | Description |
-|---|---|
-| `DATABASE_URL` | PostgreSQL connection string |
-| `JWT_SECRET` | Secret used to sign JWTs |
-| `ANTHROPIC_API_KEY` | Anthropic API key |
+Without Docker: `npm install`, `node setup.js` to create the schema (safe to re-run), `node server.js`, then `npm run dev` in `frontend/`.
 
-### Local setup
-
-```bash
-git clone https://github.com/aryansajiv19/ASCEND
-cd ASCEND
-npm install
-(cd frontend && npm install)
-node setup.js                 # create the schema (safe to re-run)
-node server.js                # API on http://localhost:3000
-(cd frontend && npm run dev)  # client on http://localhost:5000, run in a second terminal
-```
-
-The Vite dev server proxies `/api` and `/socket.io` to the API.
-
-### Docker
-
-```bash
-docker-compose up --build
-```
-
-| Service | Image | Port |
-|---|---|---|
-| `db` | `pgvector/pgvector:pg16` | 5432 |
-| `app` | Node.js 20 Alpine | 3000 |
-| `frontend` | nginx (multi-stage Vite build) | 80 |
-
-## API reference
-
-All routes except signup and login require a bearer token.
+## API
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/api/auth/signup` | Create an account |
-| POST | `/api/auth/login` | Authenticate and receive a JWT |
-| GET | `/api/workouts` | List the user's workouts |
-| POST | `/api/workouts` | Log a workout |
-| PUT | `/api/workouts/:id` | Update a workout |
-| DELETE | `/api/workouts/:id` | Delete a workout |
+| POST | `/api/auth/signup`, `/api/auth/login` | Create an account; authenticate and receive a JWT |
+| GET, POST, PUT, DELETE | `/api/workouts` | Workout CRUD |
 | GET | `/api/workouts/search?q=` | Substring search |
 | POST | `/api/workouts/semantic-search` | Ranked full-text search |
-| POST | `/api/workouts/voice` | Parse a natural-language description and log it |
-| GET | `/api/recovery` | Per-muscle recovery scores (0 to 100) |
-| POST | `/api/chat` | Streaming coaching response (SSE); body `{ message, stream: true }` |
-| GET | `/api/challenges` | List challenges |
-| POST | `/api/challenges` | Create a challenge |
-| POST | `/api/challenges/:id/join` | Join a challenge |
+| POST | `/api/workouts/voice` | Parse a description and log it |
+| GET | `/api/recovery` | Per-muscle recovery scores |
+| POST | `/api/chat` | Streaming coaching response (SSE) |
+| GET, POST | `/api/challenges`, `/api/challenges/:id/join` | List, create and join challenges |
 | GET | `/api/leaderboard/:id` | Challenge leaderboard |
 
-| WebSocket event | Direction | Description |
-|---|---|---|
-| `join_challenge` | Client to server | Subscribe to a challenge room |
-| `leave_challenge` | Client to server | Unsubscribe from a challenge room |
-| `leaderboard_update` | Server to client | Updated standings after a participant logs a workout |
+All routes except signup and login require a bearer token. WebSocket clients send `join_challenge` and `leave_challenge` and receive `leaderboard_update`.
 
-## Project structure
+## Future work
 
-```
-ASCEND/
-├── server.js            Express and socket.io entry point
-├── auth.js              Signup and login
-├── middleware.js        JWT verification
-├── chat.js              Streaming coaching endpoint
-├── voice.js             Natural-language workout parsing
-├── embeddings.js        Ranked full-text search
-├── recovery.js          Recovery scoring
-├── challenges.js        Challenge endpoints
-├── leaderboard.js       Leaderboard endpoints
-├── db.js                PostgreSQL connection pool
-├── setup.js             Idempotent schema bootstrap
-├── Dockerfile           API image
-├── docker-compose.yml   Full-stack orchestration
-└── frontend/
-    ├── Dockerfile       Multi-stage build served by nginx
-    ├── nginx.conf       SPA fallback and API reverse proxy
-    └── src/             Pages, components, API client and styles
-```
-
-## Roadmap
-
-- Embedding-based semantic search using the provisioned pgvector column
-- Token expiry and refresh for JWTs
-- Progressive-overload detection and plateau alerts
-- Training plan generation from recovery and history
-- Structured logging and request tracing
-- Automated test suite
+- Embedding-based semantic search using the pgvector column and IVFFlat index already provisioned in the schema.
+- Token expiry and refresh; JWTs are currently issued without an expiry.
+- Unit tests for the recovery model and parser, and integration tests for the API.
+- Progressive-overload detection and plateau alerts.
 
 ## License
 
-Released under the MIT License. See [LICENSE](./LICENSE).
+MIT. See [LICENSE](./LICENSE).
